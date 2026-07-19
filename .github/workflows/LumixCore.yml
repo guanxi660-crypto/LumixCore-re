@@ -1,0 +1,330 @@
+name: Auto Renew LumixCore
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # 每天 UTC 1点 (北京时间 9点)
+  workflow_dispatch:
+
+jobs:
+  Renew:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: '${{ github.repository_owner }}/LumixCore-scripts'
+          token: ${{ secrets.GH_PAT }}
+          sparse-checkout: 'renew.py'
+          sparse-checkout-cone-mode: false
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装系统依赖和 Python 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install seleniumbase requests pysocks
+          seleniumbase install chromedriver
+
+      # ----- 配置并启动代理隧道 -----
+      - name: 安装并启动代理
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "[INFO] 未配置代理，直连模式"
+            exit 0
+          fi
+
+          # 下载并解压 Sing-box (使用官方发布的 amd64 版本)
+          wget -q https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz
+          tar -xzf sing-box-1.9.3-linux-amd64.tar.gz
+          mv sing-box-1.9.3-linux-amd64/sing-box . && chmod +x sing-box
+
+          python3 << 'PYEOF'
+          import os, sys, json, base64
+          from urllib.parse import parse_qs, unquote
+
+          def mask(s):
+              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
+
+          url = os.environ.get("PROXY_URL", "").strip()
+          if not url:
+              print("[ERROR] PROXY_URL 为空")
+              sys.exit(1)
+
+          # 协议识别
+          if url.startswith("vless://"):
+              protocol = "vless"
+              content = url[8:]
+          elif url.startswith("vmess://"):
+              protocol = "vmess"
+              content = url[8:]
+          elif url.startswith("trojan://"):
+              protocol = "trojan"
+              content = url[9:]
+          elif url.startswith("ss://"):
+              protocol = "ss"
+              content = url[5:]
+          elif url.startswith("socks5://") or url.startswith("socks://"):
+              protocol = "socks5"
+              content = url.split("://")[1].split("#")[0]
+              server = content.split("@")[1].split(":")[0] if "@" in content else content.split(":")[0]
+              print(f"[INFO] SOCKS5 -> {mask(server)}")
+              with open("use_external_socks.txt", "w") as f:
+                  f.write(url.split("#")[0])
+              sys.exit(0)
+          else:
+              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
+              sys.exit(1)
+
+          if "#" in content:
+              content = content.rsplit("#", 1)[0]
+
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080, "sniff": True},
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": []
+          }
+
+          outbound = {}
+
+          if protocol == "vless":
+              uuid, rest = content.split("@", 1)
+              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
+              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+              
+              params = parse_qs(params_str)
+              security = params.get("security", ["none"])[0]
+              network = params.get("type", ["tcp"])[0]
+              sni = params.get("sni", [address])[0]
+              fp = params.get("fp", ["chrome"])[0]
+              flow = params.get("flow", [""])[0]
+              pbk = params.get("pbk", [""])[0]
+              host = params.get("host", [sni])[0]
+              path = unquote(params.get("path", ["/"])[0])
+
+              print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
+
+              outbound = {
+                  "type": "vless",
+                  "tag": "proxy",
+                  "server": address,
+                  "server_port": int(port),
+                  "uuid": uuid,
+                  "flow": flow if flow else None,
+                  "tls": {}
+              }
+              
+              if security in ["tls", "reality"]:
+                  outbound["tls"] = {
+                      "enabled": True,
+                      "server_name": sni,
+                      "utls": {"enabled": True, "fingerprint": fp}
+                  }
+                  if security == "reality":
+                      outbound["tls"]["reality"] = {"enabled": True, "public_key": pbk}
+                  else:
+                      outbound["tls"]["insecure"] = False
+
+              if network == "ws":
+                  outbound["transport"] = {
+                      "type": "ws",
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+              elif network == "grpc":
+                  service_name = params.get("serviceName", [""])[0]
+                  outbound["transport"] = {"type": "grpc", "service_name": service_name}
+
+          elif protocol == "vmess":
+              try:
+                  padding = 4 - len(content) % 4
+                  if padding != 4: content += "=" * padding
+                  vm = json.loads(base64.b64decode(content).decode("utf-8"))
+              except Exception as e:
+                  print(f"[ERROR] VMess 解析失败: {e}")
+                  sys.exit(1)
+
+              address = vm.get("add", "")
+              port = int(vm.get("port", 443))
+              uuid = vm.get("id", "")
+              security = vm.get("scy", "auto")
+              network = vm.get("net", "tcp")
+              tls = vm.get("tls", "")
+              sni = vm.get("sni", "") or vm.get("host", address)
+              host = vm.get("host", address)
+              path = vm.get("path", "/")
+              fp = vm.get("fp", "chrome")
+
+              print(f"[INFO] VMess -> {mask(address)}:{port} (network: {network}, tls: {tls})")
+
+              outbound = {
+                  "type": "vmess",
+                  "tag": "proxy",
+                  "server": address,
+                  "server_port": port,
+                  "uuid": uuid,
+                  "security": security,
+                  "tls": {}
+              }
+
+              if tls == "tls":
+                  outbound["tls"] = {
+                      "enabled": True,
+                      "server_name": sni,
+                      "insecure": False,
+                      "utls": {"enabled": True, "fingerprint": fp}
+                  }
+
+              if network == "ws":
+                  outbound["transport"] = {
+                      "type": "ws",
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+
+          elif protocol == "trojan":
+              password, rest = content.split("@", 1)
+              host_port, params_str = rest.split("?", 1) if "?" in rest else (rest, "")
+              address, port = host_port.rsplit(":", 1) if ":" in host_port else (host_port, "443")
+
+              params = parse_qs(params_str)
+              sni = params.get("sni", [address])[0]
+              network = params.get("type", ["tcp"])[0]
+              host = params.get("host", [sni])[0]
+              path = unquote(params.get("path", ["/"])[0])
+              fp = params.get("fp", ["chrome"])[0]
+
+              print(f"[INFO] Trojan -> {mask(address)}:{port} (network: {network})")
+
+              outbound = {
+                  "type": "trojan",
+                  "tag": "proxy",
+                  "server": address,
+                  "server_port": int(port),
+                  "password": password,
+                  "tls": {
+                      "enabled": True,
+                      "server_name": sni,
+                      "insecure": False,
+                      "utls": {"enabled": True, "fingerprint": fp}
+                  }
+              }
+
+              if network == "ws":
+                  outbound["transport"] = {
+                      "type": "ws",
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+
+          elif protocol == "ss":
+              try:
+                  if "@" in content:
+                      encoded, server_part = content.split("@", 1)
+                      decoded = base64.b64decode(encoded + "==").decode("utf-8")
+                      method, password = decoded.split(":", 1)
+                      address, port = server_part.split(":", 1)
+                  else:
+                      decoded = base64.b64decode(content + "==").decode("utf-8")
+                      if "@" in decoded:
+                          user_part, server_part = decoded.split("@", 1)
+                          method, password = user_part.split(":", 1)
+                          address, port = server_part.split(":", 1)
+                      else:
+                          raise ValueError("无法解析结构")
+              except Exception as e:
+                  print(f"[ERROR] Shadowsocks 解析失败: {e}")
+                  sys.exit(1)
+
+              print(f"[INFO] Shadowsocks -> {mask(address)}:{port}")
+
+              outbound = {
+                  "type": "shadowsocks",
+                  "tag": "proxy",
+                  "server": address,
+                  "server_port": int(port),
+                  "method": method,
+                  "password": password
+              }
+
+          outbound = {k: v for k, v in outbound.items() if v is not None and v != {}}
+          config["outbounds"].append(outbound)
+
+          with open("singbox_config.json", "w") as f:
+              json.dump(config, f, indent=2)
+
+          print("[INFO] ✅ Sing-box 配置已生成")
+          PYEOF
+
+          if [ -f "use_external_socks.txt" ]; then
+            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
+            echo "PROXY_URL=$EXTERNAL_SOCKS" >> $GITHUB_ENV
+            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
+            exit 0
+          fi
+
+          # 启动 Sing-box
+          ./sing-box run -c singbox_config.json > singbox.log 2>&1 &
+          sleep 5
+
+          echo "[INFO] 测试代理连接..."
+          for i in 1 2 3 4 5; do
+            if curl -x http://127.0.0.1:1081 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+              echo "[INFO] ✅ 代理连接成功"
+              # 🛠️ 关键改动：配合原版 py 脚本，将导出的环境变量名称直接指定为 PROXY_URL
+              echo "PROXY_URL=http://127.0.0.1:1081" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "[WARN] 尝试 $i/5..."
+            sleep 3
+          done
+
+          echo "[ERROR] ❌ 代理连接失败"
+          cat singbox.log
+          exit 1
+      
+      
+      
+      - name: 🚀 运行续期脚本
+        env:
+          COOKIE: ${{ secrets.COOKIE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }} 
+          PROXY_URL: ${{ env.PROXY_URL }}
+        run: |
+          xvfb-run --auto-servernum python renew.py
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f singbox_config.json singbox.log
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          runs=$(gh run list --repo "$REPO" --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete --repo "$REPO" $run_id || true
+            fi
+          done
