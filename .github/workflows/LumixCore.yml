@@ -182,6 +182,16 @@ jobs:
         run: |
           xvfb-run --auto-servernum python renew.py
 
+      - name: 📸 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renew-debug-screenshots
+          path: |
+            *.png
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
