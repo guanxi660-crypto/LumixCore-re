@@ -20,6 +20,7 @@ renew.py — LumixCore 服务器自动续期脚本
 
 import os
 import sys
+import json
 import time
 import traceback
 from urllib.parse import urlparse
@@ -34,24 +35,55 @@ from seleniumbase import SB
 RENEW_URL = "https://panel.lumixcore.com/server/0e9c0e74"
 PANEL_DOMAIN = urlparse(RENEW_URL).netloc  # panel.lumixcore.com
 
+# 面板前端点击"续期"按钮时，实际调用的接口（抓包确认）
+RENEWAL_API_PATH = "/api/client/store/generate-renewal"
+
 COOKIE = os.environ.get("COOKIE", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 
 PAGE_LOAD_TIMEOUT = 30
-CLICK_TIMEOUT = 20
+API_CALL_TIMEOUT_MS = 20000  # execute_async_script 的超时（毫秒）
 MAX_RETRIES = 3
 RETRY_DELAY = 8  # 秒
 
-# 续期按钮可能出现的文案，按顺序尝试（大小写不敏感）
-RENEW_BUTTON_TEXTS = ["Renew", "续期", "续费", "Renew Server", "立即续期"]
+# 接口返回的 body 里出现下列关键字，视为"冷却中/无需续期"，不算错误
+COOLDOWN_HINTS = ["already renewed", "cooldown", "please wait", "冷却中", "稍后再试", "not eligible", "too soon"]
 
-# 判断“已续期成功 / 无需续期”的页面关键字（出现即视为成功，不再点击）
-SUCCESS_HINTS = ["renewed", "续期成功", "expires", "到期时间", "next renewal"]
-
-# 判断“冷却中，暂不能续期”的关键字（视为正常，非错误）
-COOLDOWN_HINTS = ["already renewed", "cooldown", "please wait", "冷却中", "稍后再试"]
+# 在浏览器页面上下文里执行的 JS：读取 CSRF token cookie（不同面板命名不一样，
+# 这里按常见命名依次尝试），带上对应请求头去 POST 续期接口，
+# 最后把 {status, body} 回传给 Python。
+RENEW_FETCH_JS = """
+var callback = arguments[arguments.length - 1];
+function getCookie(name) {
+    var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? decodeURIComponent(match[2]) : null;
+}
+var candidateNames = ['X-XSRF-TOKEN', 'XSRF-TOKEN', 'XSRF_TOKEN', 'csrf_token', 'CSRF-TOKEN'];
+var xsrfToken = null;
+for (var i = 0; i < candidateNames.length; i++) {
+    var v = getCookie(candidateNames[i]);
+    if (v) { xsrfToken = v; break; }
+}
+fetch(arguments[0], {
+    method: 'POST',
+    headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-XSRF-TOKEN': xsrfToken || ''
+    },
+    credentials: 'same-origin',
+    body: JSON.stringify({})
+}).then(function(resp) {
+    return resp.text().then(function(text) {
+        callback(JSON.stringify({status: resp.status, body: text, tokenUsed: xsrfToken ? 'found' : 'NOT FOUND'}));
+    });
+}).catch(function(err) {
+    callback(JSON.stringify({status: 0, body: String(err)}));
+});
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +147,15 @@ def build_proxy_arg() -> str | None:
 def run_once() -> str:
     """
     执行一次续期流程，返回状态字符串：
-        "success"  -> 点击了续期按钮，判定为成功
-        "skipped"  -> 未到续期时间 / 已经是最新状态，无需操作
-        "unknown"  -> 页面未识别出明确状态（建议人工检查一次）
-    出错时直接抛异常，交给外层重试。
+        "success"  -> 接口返回成功状态码
+        "skipped"  -> 接口返回"冷却中/无需续期"一类的提示，不算失败
+    出错（网络异常、接口返回非预期错误码等）直接抛异常，交给外层重试。
     """
     if not COOKIE:
         raise RuntimeError("未设置 COOKIE，环境变量为空")
 
     proxy_arg = build_proxy_arg()
+    api_url = f"https://{PANEL_DOMAIN}{RENEWAL_API_PATH}"
 
     with SB(uc=True, headless=False, proxy=proxy_arg, page_load_strategy="eager") as sb:
         # 先访问一次目标域名，才能设置该域名下的 Cookie
@@ -136,61 +168,39 @@ def run_once() -> str:
             except Exception as e:
                 print(f"[WARN] 添加 Cookie {cookie['name']} 失败: {e}")
 
-        # 带着 Cookie 打开真正的续期页面
+        # 带着 Cookie 打开服务器详情页：一是让面板正常建立会话/过 Cloudflare 校验，
+        # 二是这个页面才是 XSRF-TOKEN cookie 的正确 Referer/Origin 来源
         sb.open(RENEW_URL)
         sb.wait_for_ready_state_complete(timeout=PAGE_LOAD_TIMEOUT)
-        sb.sleep(3)  # 给前端 SPA 一点渲染时间
+        sb.sleep(3)  # 给前端 SPA 一点渲染/建立会话的时间
 
-        page_text = sb.get_text("body").lower()
+        # 在页面的 JS 上下文里直接 fetch 续期接口（自动带上 Cookie + CSRF 头，
+        # 和用户真实点击按钮时浏览器发出的请求完全一致）
+        sb.driver.set_script_timeout(API_CALL_TIMEOUT_MS / 1000)
+        raw_result = sb.driver.execute_async_script(RENEW_FETCH_JS, api_url)
 
-        # 情况一：页面已经表明续期成功 / 显示了新的到期时间，无需再点
-        if any(hint.lower() in page_text for hint in SUCCESS_HINTS):
-            print("[INFO] 页面已显示到期时间/续期成功信息，跳过点击")
+        try:
+            result = json.loads(raw_result)
+        except Exception:
+            sb.save_screenshot("renew_result.png")
+            raise RuntimeError(f"接口返回内容无法解析: {raw_result!r}")
+
+        status_code = result.get("status", 0)
+        body = str(result.get("body", ""))
+        body_lower = body.lower()
+
+        print(f"[INFO] XSRF token 是否取到: {result.get('tokenUsed', 'unknown')}")
+        print(f"[INFO] 接口返回状态码: {status_code}")
+        print(f"[INFO] 接口返回内容: {body[:500]}")
+
+        if any(hint.lower() in body_lower for hint in COOLDOWN_HINTS):
             return "skipped"
 
-        # 情况二：尝试点击“续期”按钮
-        # TODO: 如果下面这几种定位方式都点不到，打开面板按 F12 找到按钮的
-        #       id / class / data-* 属性，换成 sb.click("#your-selector")
-        clicked = False
-        for text in RENEW_BUTTON_TEXTS:
-            try:
-                if sb.is_text_visible(text, "body"):
-                    sb.click(f'button:contains("{text}")', timeout=CLICK_TIMEOUT)
-                    clicked = True
-                    print(f"[INFO] 已点击按钮: {text}")
-                    break
-            except Exception:
-                continue
-
-        if not clicked:
-            # 兜底：尝试常见的按钮 class/id 命名
-            fallback_selectors = [
-                "button[class*='renew' i]",
-                "button[id*='renew' i]",
-                "[data-action='renew']",
-            ]
-            for sel in fallback_selectors:
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel, timeout=CLICK_TIMEOUT)
-                        clicked = True
-                        print(f"[INFO] 已通过选择器点击: {sel}")
-                        break
-                except Exception:
-                    continue
-
-        if not clicked:
-            sb.save_screenshot("renew_button_not_found.png")
-            raise RuntimeError("未找到续期按钮，已保存截图 renew_button_not_found.png，需要人工核对页面结构")
-
-        sb.sleep(3)
-        result_text = sb.get_text("body").lower()
-
-        if any(hint.lower() in result_text for hint in COOLDOWN_HINTS):
-            return "skipped"
+        if 200 <= status_code < 300:
+            return "success"
 
         sb.save_screenshot("renew_result.png")
-        return "success"
+        raise RuntimeError(f"接口返回非成功状态码 {status_code}: {body[:300]}")
 
 
 def main() -> None:
