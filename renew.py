@@ -12,18 +12,19 @@ renew.py — LumixCore 服务器自动续期脚本
     PROXY_URL     形如 http://127.0.0.1:1081 的本地代理地址（可选，由工作流里的
                   sing-box / 外部 SOCKS5 步骤设置）
 
-需要按你的面板实际页面结构调整的地方已用 "# TODO" 标注 —— 主要是
-“续期”按钮的选择器，以及续期成功/冷却/失败提示的判定文字，因为
-这些内容在登录态的 JS 渲染页面里，我这边拿不到真实 DOM，需要你
-打开面板按 F12 看一下再改。
+思路：
+    1. 用真实浏览器（SeleniumBase）打开面板页面，负责过 Cloudflare 之类的
+       人机校验、建立正常会话，顺带拿到浏览器实际持有的全部 Cookie。
+    2. 把这些 Cookie（以及浏览器的 User-Agent、代理设置）原样搬到 Python 的
+       requests.Session 里，真正的续期请求用 requests 直接发送 —— 这样出错信息
+       是标准的 HTTP 状态码/异常，比在浏览器 JS 里排查要清楚得多。
 """
 
 import os
 import sys
-import json
 import time
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 from seleniumbase import SB
@@ -44,42 +45,14 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 
 PAGE_LOAD_TIMEOUT = 30
-API_CALL_TIMEOUT_MS = 20000  # execute_async_script 的超时（毫秒）
 MAX_RETRIES = 3
 RETRY_DELAY = 8  # 秒
 
 # 接口返回的 body 里出现下列关键字，视为"冷却中/无需续期"，不算错误
 COOLDOWN_HINTS = ["already renewed", "cooldown", "please wait", "冷却中", "稍后再试", "not eligible", "too soon"]
 
-# 在浏览器页面上下文里执行的 JS：读取 CSRF token cookie（不同面板命名不一样，
-# 这里按常见命名依次尝试），带上对应请求头去 POST 续期接口，
-# 最后把 {status, body} 回传给 Python。
-# 在浏览器页面上下文里执行的 JS：接收 Python 传进来的 CSRF token（不在页面 JS
-# 里读 document.cookie —— 一是有些面板的 token cookie 是 HttpOnly 读不到，
-# 二是页面处于跳转/校验等特殊状态时读 document.cookie 会直接报安全错误），
-# 只负责发请求，最后把 {status, body} 回传给 Python。
-RENEW_FETCH_JS = """
-var callback = arguments[arguments.length - 1];
-var apiUrl = arguments[0];
-var xsrfToken = arguments[1];
-fetch(apiUrl, {
-    method: 'POST',
-    headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-XSRF-TOKEN': xsrfToken || ''
-    },
-    credentials: 'same-origin',
-    body: JSON.stringify({})
-}).then(function(resp) {
-    return resp.text().then(function(text) {
-        callback(JSON.stringify({status: resp.status, body: text, tokenUsed: xsrfToken ? 'found' : 'NOT FOUND'}));
-    });
-}).catch(function(err) {
-    callback(JSON.stringify({status: 0, body: String(err)}));
-});
-"""
+# CSRF token 常见的 cookie 命名（不同面板/框架习惯不一样，按顺序依次尝试）
+CSRF_COOKIE_CANDIDATES = ["X-XSRF-TOKEN", "XSRF-TOKEN", "XSRF_TOKEN", "csrf_token", "CSRF-TOKEN", "_csrf"]
 
 
 # ---------------------------------------------------------------------------
@@ -109,19 +82,14 @@ def notify(message: str) -> None:
 
 
 def parse_cookie_header(cookie_str: str) -> list[dict]:
-    """把 'a=1; b=2' 形式的 Cookie 请求头字符串解析成 selenium add_cookie 需要的字典列表。"""
+    """把 'a=1; b=2' 形式的 Cookie 请求头字符串解析成 [{name, value}, ...]。"""
     cookies = []
     for part in cookie_str.split(";"):
         part = part.strip()
         if not part or "=" not in part:
             continue
         name, value = part.split("=", 1)
-        cookies.append({
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": PANEL_DOMAIN,
-            "path": "/",
-        })
+        cookies.append({"name": name.strip(), "value": value.strip()})
     return cookies
 
 
@@ -132,27 +100,21 @@ def build_proxy_arg() -> str | None:
     parsed = urlparse(PROXY_URL)
     if parsed.hostname and parsed.port:
         return f"{parsed.hostname}:{parsed.port}"
-    # 兜底：如果传进来的本身就是 host:port 形式
     return PROXY_URL.replace("http://", "").replace("https://", "")
 
 
-CSRF_COOKIE_CANDIDATES = ["X-XSRF-TOKEN", "XSRF-TOKEN", "XSRF_TOKEN", "csrf_token", "CSRF-TOKEN"]
-
-
-def get_xsrf_token(sb) -> str | None:
-    """通过 WebDriver API（而不是页面 JS 的 document.cookie）读取 CSRF token。
-    这样即便 token cookie 是 HttpOnly，或者页面处于跳转/校验等特殊状态导致
-    document.cookie 被拒绝访问，也不受影响——因为走的是 CDP 层面的接口。
+def find_csrf_token(cookie_dict: dict) -> str | None:
+    """在浏览器实际持有的 cookie 字典里找 CSRF token：
+    先按已知命名精确匹配，找不到再退化为"名字里包含 xsrf/csrf"的模糊匹配。
     """
     for name in CSRF_COOKIE_CANDIDATES:
-        try:
-            cookie = sb.driver.get_cookie(name)
-        except Exception:
-            cookie = None
-        if cookie and cookie.get("value"):
-            from urllib.parse import unquote
+        if name in cookie_dict and cookie_dict[name]:
             print(f"[INFO] 命中 CSRF cookie 字段名: {name}")
-            return unquote(cookie["value"])
+            return unquote(cookie_dict[name])
+    for name, value in cookie_dict.items():
+        if value and ("xsrf" in name.lower() or "csrf" in name.lower()):
+            print(f"[INFO] 模糊匹配到 CSRF cookie 字段名: {name}")
+            return unquote(value)
     return None
 
 
@@ -173,24 +135,21 @@ def run_once() -> str:
     proxy_arg = build_proxy_arg()
     api_url = f"https://{PANEL_DOMAIN}{RENEWAL_API_PATH}"
 
+    # ----- 第一步：用真实浏览器建立会话，拿到完整 Cookie 和 User-Agent -----
     with SB(uc=True, headless=False, proxy=proxy_arg, page_load_strategy="eager") as sb:
-        # 先访问一次目标域名，才能设置该域名下的 Cookie
         sb.open(f"https://{PANEL_DOMAIN}")
         sb.sleep(1)
 
         for cookie in parse_cookie_header(COOKIE):
             try:
-                sb.driver.add_cookie(cookie)
+                sb.driver.add_cookie({**cookie, "domain": PANEL_DOMAIN, "path": "/"})
             except Exception as e:
                 print(f"[WARN] 添加 Cookie {cookie['name']} 失败: {e}")
 
-        # 带着 Cookie 打开服务器详情页：一是让面板正常建立会话/过 Cloudflare 校验，
-        # 二是这个页面才是 CSRF token cookie 的正确 Referer/Origin 来源
         sb.open(RENEW_URL)
         sb.wait_for_ready_state_complete(timeout=PAGE_LOAD_TIMEOUT)
         sb.sleep(3)  # 给前端 SPA 一点渲染/建立会话的时间
 
-        # 调试信息：确认浏览器真的停在了面板页面，而不是被跳转到登录页/验证页
         current_url = sb.get_current_url()
         print(f"[INFO] 当前页面 URL: {current_url}")
         sb.save_screenshot("debug_before_fetch.png")
@@ -201,35 +160,53 @@ def run_once() -> str:
                 f"已保存截图 debug_before_fetch.png"
             )
 
-        xsrf_token = get_xsrf_token(sb)
-        print(f"[INFO] XSRF token 是否取到: {'found' if xsrf_token else 'NOT FOUND'}")
+        all_cookies = sb.driver.get_cookies()
+        cookie_dict = {c["name"]: c["value"] for c in all_cookies}
+        print(f"[INFO] 浏览器当前持有的 Cookie 字段: {sorted(cookie_dict.keys())}")
 
-        # 在页面的 JS 上下文里直接 fetch 续期接口（自动带上 Cookie，token 由
-        # Python 传入，不在 JS 里读 document.cookie）
-        sb.driver.set_script_timeout(API_CALL_TIMEOUT_MS / 1000)
-        raw_result = sb.driver.execute_async_script(RENEW_FETCH_JS, api_url, xsrf_token or "")
+        user_agent = sb.driver.execute_script("return navigator.userAgent;")
 
-        try:
-            result = json.loads(raw_result)
-        except Exception:
-            sb.save_screenshot("renew_result.png")
-            raise RuntimeError(f"接口返回内容无法解析: {raw_result!r}")
+    # ----- 第二步：浏览器关闭后，用 requests 复用这些 Cookie 直接发续期请求 -----
+    session = requests.Session()
+    for name, value in cookie_dict.items():
+        session.cookies.set(name, value, domain=PANEL_DOMAIN, path="/")
 
-        status_code = result.get("status", 0)
-        body = str(result.get("body", ""))
-        body_lower = body.lower()
+    if PROXY_URL:
+        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
 
-        print(f"[INFO] 接口返回状态码: {status_code}")
-        print(f"[INFO] 接口返回内容: {body[:500]}")
+    xsrf_token = find_csrf_token(cookie_dict)
+    print(f"[INFO] XSRF token 是否取到: {'found' if xsrf_token else 'NOT FOUND'}")
 
-        if any(hint.lower() in body_lower for hint in COOLDOWN_HINTS):
-            return "skipped"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": RENEW_URL,
+        "Origin": f"https://{PANEL_DOMAIN}",
+        "User-Agent": user_agent or "Mozilla/5.0",
+    }
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
 
-        if 200 <= status_code < 300:
-            return "success"
+    try:
+        resp = session.post(api_url, headers=headers, json={}, timeout=30)
+    except requests.RequestException as e:
+        raise RuntimeError(f"请求续期接口时发生网络错误: {e}")
 
-        sb.save_screenshot("renew_result.png")
-        raise RuntimeError(f"接口返回非成功状态码 {status_code}: {body[:300]}")
+    status_code = resp.status_code
+    body = resp.text
+    body_lower = body.lower()
+
+    print(f"[INFO] 接口返回状态码: {status_code}")
+    print(f"[INFO] 接口返回内容: {body[:500]}")
+
+    if any(hint.lower() in body_lower for hint in COOLDOWN_HINTS):
+        return "skipped"
+
+    if 200 <= status_code < 300:
+        return "success"
+
+    raise RuntimeError(f"接口返回非成功状态码 {status_code}: {body[:300]}")
 
 
 def main() -> None:
