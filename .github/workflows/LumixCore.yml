@@ -14,11 +14,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-        with:
-          repository: '${{ github.repository_owner }}/LumixCore-scripts'
-          token: ${{ secrets.GH_PAT }}
-          sparse-checkout: 'renew.py'
-          sparse-checkout-cone-mode: false
+        # 不再需要 token / repository / sparse-checkout：
+        # 直接拉取当前仓库（LumixCore-re）自身的代码，renew.py 就放在这个仓库里
 
       - name: ⚙ 设置 Python
         uses: actions/setup-python@v6
@@ -59,7 +56,6 @@ jobs:
               print("[ERROR] PROXY_URL 为空")
               sys.exit(1)
 
-          # ----- 定义 Sing-box 基础配置（必须在协议识别之前） -----
           config = {
               "log": {"level": "warn"},
               "inbounds": [
@@ -69,27 +65,25 @@ jobs:
               "outbounds": []
           }
 
-          # ----- 协议识别 -----
           if url.startswith("vless://"):
               protocol = "vless"
               content = url[8:]
-              # ... VLESS 解析（完整代码，此处省略，实际需保留原样） ...
-              # 解析后设置 outbound 变量（假设已完成）
-              outbound = {}  # 占位，实际由完整分支生成
+              # TODO: 按需补全 VLESS 解析逻辑
+              outbound = {}
           elif url.startswith("vmess://"):
               protocol = "vmess"
               content = url[8:]
-              # ... VMess 解析（完整代码，此处省略） ...
+              # TODO: 按需补全 VMess 解析逻辑
               outbound = {}
           elif url.startswith("trojan://"):
               protocol = "trojan"
               content = url[9:]
-              # ... Trojan 解析（完整代码，此处省略） ...
+              # TODO: 按需补全 Trojan 解析逻辑
               outbound = {}
           elif url.startswith("ss://"):
               protocol = "ss"
               content = url[5:]
-              # ... Shadowsocks 解析（完整代码，此处省略） ...
+              # TODO: 按需补全 Shadowsocks 解析逻辑
               outbound = {}
           elif url.startswith("socks5://") or url.startswith("socks://"):
               protocol = "socks5"
@@ -98,50 +92,36 @@ jobs:
               print(f"[INFO] SOCKS5 -> {mask(server)}")
               with open("use_external_socks.txt", "w") as f:
                   f.write(url.split("#")[0])
-              sys.exit(0)  # 外部 SOCKS5 直接退出，不生成 config
-          # ========== 新增 Hysteria2 支持 ==========
+              sys.exit(0)
           elif url.startswith("hy2://") or url.startswith("hysteria2://"):
               protocol = "hy2" if url.startswith("hy2://") else "hysteria2"
               content = url.split("://", 1)[1]
-
-              # 去除 # 注释
               if "#" in content:
                   content = content.rsplit("#", 1)[0]
-
-              # 分离 auth 和服务器部分
               auth = None
               if "@" in content:
                   auth, server_part = content.split("@", 1)
               else:
                   server_part = content
-
-              # 分离 host:port 与查询参数
               if "?" in server_part:
                   host_port, query_str = server_part.split("?", 1)
               else:
                   host_port = server_part
                   query_str = ""
-
-              # 解析 host 和 port
               if ":" in host_port:
                   host, port = host_port.rsplit(":", 1)
               else:
                   host = host_port
                   port = "443"
               port = int(port)
-
-              # 解析参数
               params = parse_qs(query_str)
               sni = params.get("sni", [host])[0]
-              # 同时检查 insecure 和 allowInsecure
               insecure_val = params.get("insecure", ["0"])[0]
               allow_insecure_val = params.get("allowInsecure", ["0"])[0]
               insecure = (insecure_val.lower() in ("1", "true")) or (allow_insecure_val.lower() in ("1", "true"))
               pin_sha256 = params.get("pinSHA256", [""])[0]
-
               password = auth if auth else ""
               print(f"[INFO] Hysteria2 -> {host}:{port} (sni: {sni}, insecure: {insecure})")
-
               outbound = {
                   "type": "hysteria2",
                   "tag": "proxy",
@@ -156,23 +136,18 @@ jobs:
               }
               if pin_sha256:
                   outbound["tls"]["pin_sha256"] = pin_sha256
-              # 如有 obfs 可添加 transport（略）
-          # ======================================
           else:
               print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
               sys.exit(1)
 
-          # ----- 所有分支（除 SOCKS5 外）都会设置 outbound，将其加入 config -----
           outbound = {k: v for k, v in outbound.items() if v is not None and v != {}}
           config["outbounds"].append(outbound)
 
           with open("singbox_config.json", "w") as f:
               json.dump(config, f, indent=2)
-
           print("[INFO] ✅ Sing-box 配置已生成")
           PYEOF
 
-          # ----- 后续启动代理（与之前相同）-----
           if [ -f "use_external_socks.txt" ]; then
             EXTERNAL_SOCKS=$(cat use_external_socks.txt)
             echo "PROXY_URL=$EXTERNAL_SOCKS" >> $GITHUB_ENV
