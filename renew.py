@@ -22,6 +22,7 @@ renew.py — LumixCore 服务器自动续期脚本
 
 import os
 import sys
+import json
 import time
 import traceback
 from urllib.parse import urlparse, unquote
@@ -82,8 +83,26 @@ def notify(message: str) -> None:
 
 
 def parse_cookie_header(cookie_str: str) -> list[dict]:
-    """把 'a=1; b=2' 形式的 Cookie 请求头字符串解析成 [{name, value}, ...]。"""
+    """支持两种格式：
+    1. 浏览器 Network 面板的 Cookie 请求头字符串：'a=1; b=2'
+    2. 浏览器插件导出的 JSON 数组：[{"name": "...", "value": "...", ...}, ...]
+    """
+    cookie_str = cookie_str.strip()
     cookies = []
+
+    if cookie_str.startswith("["):
+        try:
+            items = json.loads(cookie_str)
+        except Exception as e:
+            print(f"[WARN] COOKIE 内容看起来像 JSON 数组，但解析失败: {e}")
+            return []
+        for item in items:
+            name = item.get("name")
+            value = item.get("value")
+            if name and value is not None:
+                cookies.append({"name": name, "value": value})
+        return cookies
+
     for part in cookie_str.split(";"):
         part = part.strip()
         if not part or "=" not in part:
@@ -101,6 +120,17 @@ def build_proxy_arg() -> str | None:
     if parsed.hostname and parsed.port:
         return f"{parsed.hostname}:{parsed.port}"
     return PROXY_URL.replace("http://", "").replace("https://", "")
+
+
+def normalize_proxy_for_requests(proxy_url: str) -> str:
+    """requests/urllib3 不认识裸的 'socks://' scheme，必须是 socks5:// 或 socks4://。
+    这里把常见的 'socks://' 统一改成 'socks5://'，其余 scheme（http/https/socks5/socks4）原样返回。
+    """
+    if proxy_url.startswith("socks://"):
+        fixed = "socks5://" + proxy_url[len("socks://"):]
+        print(f"[INFO] 代理 scheme 'socks://' 不被 requests 支持，已自动转换为 'socks5://'")
+        return fixed
+    return proxy_url
 
 
 def find_csrf_token(cookie_dict: dict) -> str | None:
@@ -132,6 +162,14 @@ def run_once() -> str:
     if not COOKIE:
         raise RuntimeError("未设置 COOKIE，环境变量为空")
 
+    parsed_cookies = parse_cookie_header(COOKIE)
+    print(f"[INFO] 从 COOKIE 环境变量解析到 {len(parsed_cookies)} 个字段: {[c['name'] for c in parsed_cookies]}")
+    if not parsed_cookies:
+        raise RuntimeError(
+            "COOKIE 环境变量内容非空，但按 'name=value; name2=value2' 格式解析出 0 个字段，"
+            "请确认 Secret 里存的是完整的 Cookie 请求头字符串，而不是单个 token 值或其他内容"
+        )
+
     proxy_arg = build_proxy_arg()
     api_url = f"https://{PANEL_DOMAIN}{RENEWAL_API_PATH}"
 
@@ -140,7 +178,7 @@ def run_once() -> str:
         sb.open(f"https://{PANEL_DOMAIN}")
         sb.sleep(1)
 
-        for cookie in parse_cookie_header(COOKIE):
+        for cookie in parsed_cookies:
             try:
                 sb.driver.add_cookie({**cookie, "domain": PANEL_DOMAIN, "path": "/"})
             except Exception as e:
@@ -172,7 +210,8 @@ def run_once() -> str:
         session.cookies.set(name, value, domain=PANEL_DOMAIN, path="/")
 
     if PROXY_URL:
-        session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        proxy_for_requests = normalize_proxy_for_requests(PROXY_URL)
+        session.proxies = {"http": proxy_for_requests, "https": proxy_for_requests}
 
     xsrf_token = find_csrf_token(cookie_dict)
     print(f"[INFO] XSRF token 是否取到: {'found' if xsrf_token else 'NOT FOUND'}")
